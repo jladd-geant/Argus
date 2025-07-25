@@ -10,7 +10,7 @@ from django.contrib.auth import get_user_model
 from django.core.exceptions import ValidationError
 from django.core.validators import URLValidator
 from django.db import models
-from django.db.models import F, Q
+from django.db.models import F, Q, Exists, OuterRef
 from django.utils import timezone
 
 from argus.util.datetime_utils import INFINITY_REPR, get_infinity_repr
@@ -316,6 +316,25 @@ class IncidentQuerySet(models.QuerySet):
     def lacks_details_url(self):
         return self.filter(details_url="")
 
+    @staticmethod
+    def ack_filter():
+        acks_query = Q(ack__isnull=False)
+        acks_not_expired_query = Q(ack__expiration__isnull=True) | Q(ack__expiration__gt=timezone.now())
+        # This is specifically for when acks are just created
+        # The event (with type ACK) is created before the acknowledgement
+        # which triggers the notification sending which uses this function
+        # which is why we have to have this additional check
+        ack_is_just_being_created = Q(type=Event.Type.ACKNOWLEDGE) & Q(ack__isnull=True)
+        return (acks_query & acks_not_expired_query) | ack_is_just_being_created
+
+    def precompute_acked(self):
+        # This is MUCH faster when computing acked for a large number of rows
+        ack_filter_sq = self.ack_filter()
+        qs = self.annotate(
+            acked_precomputed=Exists(Event.objects.filter(ack_filter_sq).filter(incident=OuterRef("pk")))
+        )
+        return qs
+
     def prefetch_default_related(self):
         return self.prefetch_related("incident_tag_relations__tag", "source__type")
 
@@ -518,15 +537,9 @@ class Incident(models.Model):
 
     @property
     def acked(self):
-        acks_query = Q(ack__isnull=False)
-        acks_not_expired_query = Q(ack__expiration__isnull=True) | Q(ack__expiration__gt=timezone.now())
-        # This is specifically for when acks are just created
-        # The event (with type ACK) is created before the acknowledgement
-        # which triggers the notification sending which uses this function
-        # which is why we have to have this additional check
-        ack_is_just_being_created = Q(type=Event.Type.ACKNOWLEDGE) & Q(ack__isnull=True)
-
-        return self.events.filter((acks_query & acks_not_expired_query) | ack_is_just_being_created).exists()
+        if hasattr(self, "acked_precomputed"):
+            return self.acked_precomputed
+        return self.events.filter(IncidentQuerySet.ack_filter()).exists()
 
     def is_acked_by(self, group: str) -> bool:
         return group in self.acks.active().group_names()

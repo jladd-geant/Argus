@@ -271,7 +271,7 @@ class SourceLockedIncidentViewSet(BaseIncidentViewSet):
     filterset_class = SourceLockedIncidentFilter
 
     def get_queryset(self):
-        return Incident.objects.filter(source__user=self.request.user).prefetch_default_related()
+        return Incident.objects.filter(source__user=self.request.user).precompute_acked().prefetch_default_related()
 
 
 @extend_schema_view(
